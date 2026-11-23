@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Recursively collect supported images from a website (Arachnida Exercise 1)."""
+
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from html.parser import HTMLParser
+from pathlib import Path
+import re
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.parse import urldefrag, unquote, urljoin, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
+
+
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp"}
+USER_AGENT = "Arachnida/1.0 (educational project)"
+TIMEOUT_SECONDS = 15
+MAX_HTML_BYTES = 5 * 1024 * 1024
+CHUNK_BYTES = 64 * 1024
+
+
+class PageParser(HTMLParser):
+    """Collect page links and image references without a crawler library."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.page_links: list[str] = []
+        self.image_links: list[str] = []
+
+    @staticmethod
+    def _split_srcset(value: str) -> list[str]:
+        # Data URLs are deliberately ignored; ordinary URL/density pairs are kept.
+        urls = []
+        for candidate in value.split(","):
+            parts = candidate.strip().split()
+            if parts and not parts[0].lower().startswith("data:"):
+                urls.append(parts[0])
+        return urls
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {name.lower(): value for name, value in attrs if value is not None}
+        tag = tag.lower()
+
+        if tag == "a" and values.get("href"):
+            self.page_links.append(values["href"])
+
+        if tag in {"img", "source"}:
+            for attribute in ("src", "data-src", "data-original"):
+                if values.get(attribute):
+                    self.image_links.append(values[attribute])
+            if values.get("srcset"):
+                self.image_links.extend(self._split_srcset(values["srcset"]))
+
+        if tag == "link" and "image_src" in values.get("rel", "").lower().split():
+            if values.get("href"):
+                self.image_links.append(values["href"])
+
+        if tag == "meta":
+            property_name = values.get("property", "").lower()
+            name = values.get("name", "").lower()
+            if (property_name == "og:image" or name == "twitter:image") and values.get("content"):
+                self.image_links.append(values["content"])
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="spider",
+        description="Extract supported images from a website, optionally following its pages.",
+        epilog="Supported image extensions: .jpg, .jpeg, .png, .gif, .bmp",
+    )
+    parser.add_argument("-r", "--recursive", action="store_true", help="follow pages on the starting website")
+    parser.add_argument("-l", "--level", type=int, help="maximum page depth (default: 5 when recursive)")
+    parser.add_argument("-p", "--path", default="./data/", help="directory for downloaded images (default: ./data/)")
+    parser.add_argument("url", help="starting HTTP or HTTPS URL")
+    args = parser.parse_args()
+
+    if args.level is not None and args.level < 0:
+        parser.error("--level must be zero or greater")
+    args.recursive = args.recursive or args.level is not None
+    args.level = args.level if args.level is not None else 5
+    return args
+
+
+def normalize_url(url: str) -> str:
+    """Remove fragments and normalize a URL for visited-set comparisons."""
+    url, _fragment = urldefrag(url.strip())
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    path = parts.path or "/"
+    return urlunsplit((scheme, netloc, path, parts.query, ""))
+
+
+def is_http_url(url: str) -> bool:
+    return urlsplit(url).scheme.lower() in {"http", "https"}
+
+
+def is_supported_image(url: str) -> bool:
+    suffix = Path(unquote(urlsplit(url).path)).suffix.lower()
+    return suffix in SUPPORTED_EXTENSIONS
+
+
+def request_url(url: str):
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+    return urlopen(request, timeout=TIMEOUT_SECONDS)
+
+
+def same_origin(url: str, origin: tuple[str, str]) -> bool:
+    parts = urlsplit(url)
+    return (parts.scheme.lower(), parts.netloc.lower()) == origin
+
+
+def safe_filename(url: str) -> str:
+    name = Path(unquote(urlsplit(url).path)).name
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    if not name or name in {".", ".."}:
+        return "image" + Path(urlsplit(url).path).suffix.lower()
+    return name
+
+
+def unique_destination(directory: Path, filename: str) -> Path:
+    destination = directory / filename
+    if not destination.exists():
+        return destination
+    stem, suffix = destination.stem, destination.suffix
+    counter = 1
+    while True:
+        candidate = directory / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def download_image(url: str, directory: Path) -> bool:
+    try:
+        with request_url(url) as response:
+            destination = unique_destination(directory, safe_filename(url))
+            with destination.open("wb") as output:
+                while True:
+                    chunk = response.read(CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+        print(f"[image] {url} -> {destination}")
+        return True
+    except (HTTPError, URLError, OSError, TimeoutError, ValueError) as exc:
+        print(f"[skip] Could not download {url}: {exc}", file=sys.stderr)
+        return False
+
+
+def read_page(url: str) -> tuple[str, str] | None:
+    try:
+        with request_url(url) as response:
+            content_type = response.headers.get_content_type()
+            if content_type not in {"text/html", "application/xhtml+xml"}:
+                return None
+            body = response.read(MAX_HTML_BYTES + 1)
+            if len(body) > MAX_HTML_BYTES:
+                print(f"[skip] HTML page is larger than {MAX_HTML_BYTES} bytes: {url}", file=sys.stderr)
+                return None
+            charset = response.headers.get_content_charset() or "utf-8"
+            final_url = response.geturl()
+        return body.decode(charset, errors="replace"), final_url
+    except (HTTPError, URLError, OSError, TimeoutError, LookupError, ValueError) as exc:
+        print(f"[skip] Could not read {url}: {exc}", file=sys.stderr)
+        return None
+
+
+def crawl(start_url: str, recursive: bool, max_depth: int, output_dir: Path) -> int:
+    if not is_http_url(start_url):
+        print("Error: URL must use HTTP or HTTPS.", file=sys.stderr)
+        return 2
+
+    start_url = normalize_url(start_url)
+    start_parts = urlsplit(start_url)
+    origin = (start_parts.scheme.lower(), start_parts.netloc.lower())
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pages = deque([(start_url, 0)])
+    visited_pages: set[str] = set()
+    found_images: set[str] = set()
+    downloaded_images: set[str] = set()
+
+    while pages:
+        page_url, depth = pages.popleft()
+        page_url = normalize_url(page_url)
+        if page_url in visited_pages:
+            continue
+        visited_pages.add(page_url)
+        print(f"[page depth={depth}] {page_url}")
+
+        if is_supported_image(page_url):
+            found_images.add(page_url)
+            continue
+
+        page_result = read_page(page_url)
+        if page_result is None:
+            continue
+        html, final_url = page_result
+        parser = PageParser()
+        parser.feed(html)
+        parser.close()
+
+        for reference in parser.image_links:
+            image_url = normalize_url(urljoin(final_url, reference))
+            if is_http_url(image_url) and is_supported_image(image_url):
+                found_images.add(image_url)
+
+        if recursive and depth < max_depth:
+            for reference in parser.page_links:
+                next_url = normalize_url(urljoin(final_url, reference))
+                if is_http_url(next_url) and same_origin(next_url, origin) and next_url not in visited_pages:
+                    pages.append((next_url, depth + 1))
+
+    for image_url in sorted(found_images):
+        if image_url in downloaded_images:
+            continue
+        downloaded_images.add(image_url)
+        download_image(image_url, output_dir)
+
+    print(f"\nVisited pages: {len(visited_pages)}")
+    print(f"Found supported images: {len(found_images)}")
+    print(f"Output directory: {output_dir.resolve()}")
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    return crawl(args.url, args.recursive, args.level, Path(args.path))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
